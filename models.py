@@ -16,6 +16,7 @@ class Flight(BaseModel):
     departure_time: datetime.datetime
     arrival_time: datetime.datetime
     price: float
+    airline: str
     stops: int
 
 

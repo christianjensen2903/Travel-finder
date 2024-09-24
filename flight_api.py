@@ -83,6 +83,7 @@ class RyanAirAPI:
                     arrival_time=arrival_time,
                     price=offer["outbound"]["price"]["value"] * adults,
                     stops=0,
+                    airline="Ryanair",
                 )
             )
 
@@ -128,7 +129,12 @@ class BookingDotComAPI:
         to_airport: Airport,
     ) -> list[Flight]:
 
-        offers = data["data"]["flightOffers"]
+        try:
+            offers = data["data"]["flightOffers"]
+        except KeyError as e:
+            print(data)
+            return []
+
         flights = []
 
         for offer in offers:
@@ -138,6 +144,8 @@ class BookingDotComAPI:
             arrival_time = datetime.datetime.fromisoformat(
                 offer["segments"][-1]["arrivalTime"]
             )
+            airline = offer["segments"][0]["legs"][0]["carriersData"][0]["name"]
+
             flights.append(
                 Flight(
                     departure=from_airport,
@@ -145,7 +153,8 @@ class BookingDotComAPI:
                     departure_time=departure_time,
                     arrival_time=arrival_time,
                     price=offer["priceBreakdown"]["total"]["units"],
-                    stops=len(offer["segments"]) - 1,
+                    stops=len(offer["segments"][0]["legs"]) - 1,
+                    airline=airline,
                 )
             )
 
@@ -186,4 +195,4 @@ class BookingDotComAPI:
 
 if __name__ == "__main__":
     flight_api = FlightAPI()
-    print(flight_api.get_airports())
+    flight_api.get_flights("CPH", "AGP", datetime.date(2024, 10, 5))
