@@ -1,0 +1,4 @@
+tqdm==4.67.1
+airportsdata==20250224
+pandas==2.2.3
+requests==2.32.3
