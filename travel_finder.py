@@ -5,7 +5,6 @@ from flight_db import FlightDB
 from hotel_db import HotelDB
 from models import Airport, Flight
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class TravelFinder:
@@ -62,9 +61,9 @@ class TravelFinder:
 
         # Reduce each flight to the cheapest one
         reduced_flights: list[tuple[Flight, Flight]] = []
-        for flights in flights:
-            out_flights = flights[0]
-            back_flights = flights[1]
+        for flight_pair in flights:
+            out_flights = flight_pair[0]
+            back_flights = flight_pair[1]
 
             out_flights = [
                 flight for flight in out_flights if flight.stops <= max_stops

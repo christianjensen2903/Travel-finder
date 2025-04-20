@@ -1,10 +1,9 @@
 import datetime
-import json
 from models import Flight, Airport
 import requests
 import os
 from dotenv import load_dotenv
-import airportsdata
+import airportsdata  # type: ignore
 
 
 class FlightAPI:
@@ -177,7 +176,7 @@ class BookingDotComAPI:
             "toId": f"{to_airport.code}.AIRPORT",
             "departDate": departDate_str,
             "pageNo": "1",
-            "adults": adults,
+            "adults": str(adults),
             "sort": "BEST",
             "cabinClass": "ECONOMY",
             "currency_code": currency_code,
