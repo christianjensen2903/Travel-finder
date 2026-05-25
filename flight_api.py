@@ -1,6 +1,6 @@
 import datetime
 from models import Flight, Airport
-import requests
+import requests  # type: ignore
 import os
 from dotenv import load_dotenv
 import airportsdata  # type: ignore

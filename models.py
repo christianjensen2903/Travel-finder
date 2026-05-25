@@ -1,6 +1,5 @@
 from pydantic import BaseModel
 import datetime
-import json
 
 
 class Airport(BaseModel):

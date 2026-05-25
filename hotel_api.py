@@ -1,6 +1,6 @@
 import datetime
 from models import Hotel
-import requests
+import requests  # type: ignore
 import os
 from dotenv import load_dotenv
 import json
