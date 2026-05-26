@@ -1,10 +1,34 @@
 import datetime
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from flight_api import FlightAPI
 from hotel_api import HotelAPI
 from flight_db import FlightDB
 from hotel_db import HotelDB
-from models import Airport, Flight
+from models import Airport, Flight, Hotel, TravelOption
 from tqdm import tqdm  # type: ignore
+
+
+def _default_max_workers() -> int:
+    return max(1, int(os.getenv("MAX_WORKERS", "8")))
+
+
+@dataclass(frozen=True)
+class HotelSearchTask:
+    destination_code: str
+    city: str
+    country: str
+    checkin_date: datetime.date
+    checkout_date: datetime.date
+
+
+@dataclass
+class DestinationFlightOptions:
+    outbound_one_way: list[Flight]
+    return_one_way: list[Flight]
+    round_trips: list[tuple[Flight, Flight]]
 
 
 class TravelFinder:
@@ -13,9 +37,26 @@ class TravelFinder:
         self.hotel_api = HotelAPI()
         self.flight_db = FlightDB()
         self.hotel_db = HotelDB()
+        self._inflight_lock = threading.Lock()
+        self._inflight: dict[tuple, threading.Event] = {}
 
         self.flight_db.load_db()
         self.hotel_db.load_db()
+
+    @staticmethod
+    def _pick_cheapest_hotel(
+        hotels: list[Hotel],
+        min_hotel_rating: float | None = None,
+        min_hotel_stars: int | None = None,
+    ) -> Hotel | None:
+        eligible = hotels
+        if min_hotel_rating is not None:
+            eligible = [hotel for hotel in eligible if hotel.rating >= min_hotel_rating]
+        if min_hotel_stars is not None:
+            eligible = [hotel for hotel in eligible if hotel.stars >= min_hotel_stars]
+        if not eligible:
+            return None
+        return min(eligible, key=lambda hotel: hotel.price)
 
     def find_cheapest_travels(
         self,
@@ -34,6 +75,10 @@ class TravelFinder:
         auto_extend_trip: bool = True,
         adults: int = 2,
         currency_code: str = "DKK",
+        include_hotels: bool = False,
+        min_hotel_rating: float | None = None,
+        min_hotel_stars: int | None = None,
+        max_workers: int | None = None,
     ):
         """
         A full day is defined as a day from 12am to 11:59pm. or 8am to 20pm.
@@ -55,91 +100,32 @@ class TravelFinder:
                 start_date, end_date, exclude_dates, vacation_days, min_days, max_days
             )
 
+        workers = max_workers or _default_max_workers()
+        print(f"Using {workers} parallel workers (override with MAX_WORKERS in .env)")
+
         flights = self.find_flights(
-            dates, fly_from, destinations, adults, currency_code
+            dates, fly_from, destinations, adults, currency_code, workers
         )
 
-        # Reduce each flight to the cheapest one
         reduced_flights: list[tuple[Flight, Flight]] = []
-        for flight_pair in flights:
-            out_flights = flight_pair[0]
-            back_flights = flight_pair[1]
-
-            out_flights = [
-                flight for flight in out_flights if flight.stops <= max_stops
-            ]
-            back_flights = [
-                flight for flight in back_flights if flight.stops <= max_stops
-            ]
-
-            if max_flight_duration:
-
-                out_flights = [
-                    flight
-                    for flight in out_flights
-                    if (flight.arrival_time - flight.departure_time).total_seconds()
-                    / 3600
-                    <= max_flight_duration
-                ]
-                back_flights = [
-                    flight
-                    for flight in back_flights
-                    if (flight.arrival_time - flight.departure_time).total_seconds()
-                    / 3600
-                    <= max_flight_duration
-                ]
-
-            # Remove bad flights i.e. flights arriving between 22pm and 5am
-            if remove_bad_flights:
-                out_flights = [
-                    flight
-                    for flight in out_flights
-                    if flight.arrival_time.hour > 6 and flight.arrival_time.hour < 22
-                ]
-                back_flights = [
-                    flight
-                    for flight in back_flights
-                    if flight.arrival_time.hour > 6 and flight.arrival_time.hour < 22
-                ]
-
-            if len(out_flights) == 0 or len(back_flights) == 0:
-                continue
-
-            # Remove flights before 18pm if an extended day i.e. if out-back are more than max_days
-            vacation_days_used = self._count_vacation_days_in_stay(
-                out_flights[0].arrival_time.date(),
-                back_flights[0].departure_time.date(),
+        for flight_options in flights:
+            cheapest_trip = self._select_cheapest_trip(
+                flight_options,
+                vacation_days=vacation_days,
+                max_stops=max_stops,
+                max_flight_duration=max_flight_duration,
+                remove_bad_flights=remove_bad_flights,
+                min_full_days=min_full_days,
+                auto_extend_trip=auto_extend_trip,
             )
+            if cheapest_trip is not None:
+                reduced_flights.append(cheapest_trip)
 
-            if auto_extend_trip and vacation_days_used > vacation_days:
-                out_flights = [
-                    flight for flight in out_flights if flight.departure_time.hour > 16
-                ]
-                if len(out_flights) == 0:
-                    continue
+        # Find cheapest trip for each destination
+        cheapest_travels: dict[str, TravelOption] = {}
+        hotel_tasks: list[HotelSearchTask] = []
+        trips_by_destination: dict[str, list[tuple[Flight, Flight]]] = {}
 
-            days_between = (
-                back_flights[0].departure_time.date()
-                - out_flights[0].arrival_time.date()
-            ).days + 1
-
-            # if the trip is exactly min_full_days, we need to remove flight arriving after 12 pm and departing before 20pm
-            if days_between == min_full_days:
-                out_flights = [
-                    flight for flight in out_flights if flight.arrival_time.hour < 12
-                ]
-                back_flights = [
-                    flight for flight in back_flights if flight.departure_time.hour > 20
-                ]
-                if len(out_flights) == 0 or len(back_flights) == 0:
-                    continue
-
-            cheapest_out = min(out_flights, key=lambda x: x.price)
-            cheapest_back = min(back_flights, key=lambda x: x.price)
-            reduced_flights.append((cheapest_out, cheapest_back))
-
-        # Find cheapest flight for each destination
-        cheapest_flights: dict[str, tuple[Flight, Flight]] = {}
         for destination in destinations:
             trips_to_dest = [
                 (out, back)
@@ -150,13 +136,95 @@ class TravelFinder:
             if len(trips_to_dest) == 0:
                 continue
 
-            cheapest_flights[destination.code] = min(
-                trips_to_dest, key=lambda x: x[0].price + x[1].price
+            trips_by_destination[destination.code] = trips_to_dest
+
+            if not include_hotels:
+                continue
+
+            trips_by_stay: dict[
+                tuple[datetime.date, datetime.date], list[tuple[Flight, Flight]]
+            ] = {}
+            for outbound, inbound in trips_to_dest:
+                stay_key = (
+                    outbound.arrival_time.date(),
+                    inbound.departure_time.date(),
+                )
+                trips_by_stay.setdefault(stay_key, []).append((outbound, inbound))
+
+            for checkin_date, checkout_date in trips_by_stay:
+                hotel_tasks.append(
+                    HotelSearchTask(
+                        destination_code=destination.code,
+                        city=destination.city,
+                        country=destination.country,
+                        checkin_date=checkin_date,
+                        checkout_date=checkout_date,
+                    )
+                )
+
+        hotel_prices: dict[tuple[str, datetime.date, datetime.date], Hotel] = {}
+        if include_hotels and hotel_tasks:
+            hotel_prices = self._lookup_hotels_parallel(
+                hotel_tasks,
+                adults,
+                currency_code,
+                workers,
+                min_hotel_rating,
+                min_hotel_stars,
             )
 
-        self.flight_db.save_db()
+        for destination in destinations:
+            trips_to_dest = trips_by_destination.get(destination.code, [])
+            if not trips_to_dest:
+                continue
 
-        return cheapest_flights
+            if not include_hotels:
+                outbound, inbound = min(
+                    trips_to_dest, key=lambda trip: trip[0].price + trip[1].price
+                )
+                cheapest_travels[destination.code] = TravelOption(
+                    outbound=outbound, inbound=inbound
+                )
+                continue
+
+            best_option: TravelOption | None = None
+            best_total = float("inf")
+
+            trips_by_stay: dict[
+                tuple[datetime.date, datetime.date], list[tuple[Flight, Flight]]
+            ] = {}
+            for outbound, inbound in trips_to_dest:
+                stay_key = (
+                    outbound.arrival_time.date(),
+                    inbound.departure_time.date(),
+                )
+                trips_by_stay.setdefault(stay_key, []).append((outbound, inbound))
+
+            for (checkin_date, checkout_date), trips in trips_by_stay.items():
+                hotel = hotel_prices.get(
+                    (destination.code, checkin_date, checkout_date)
+                )
+                if hotel is None:
+                    continue
+
+                outbound, inbound = min(
+                    trips, key=lambda trip: trip[0].price + trip[1].price
+                )
+                option = TravelOption(
+                    outbound=outbound, inbound=inbound, hotel=hotel
+                )
+                if option.total < best_total:
+                    best_total = option.total
+                    best_option = option
+
+            if best_option is not None:
+                cheapest_travels[destination.code] = best_option
+
+        self.flight_db.save_db()
+        if include_hotels:
+            self.hotel_db.save_db()
+
+        return cheapest_travels
 
     def find_travels(
         self,
@@ -179,6 +247,25 @@ class TravelFinder:
         )
         return flights
 
+    def _wait_for_inflight(self, key: tuple) -> None:
+        with self._inflight_lock:
+            event = self._inflight.get(key)
+        if event is not None:
+            event.wait()
+
+    def _begin_inflight(self, key: tuple) -> bool:
+        with self._inflight_lock:
+            if key in self._inflight:
+                return False
+            self._inflight[key] = threading.Event()
+            return True
+
+    def _finish_inflight(self, key: tuple) -> None:
+        with self._inflight_lock:
+            event = self._inflight.pop(key, None)
+        if event is not None:
+            event.set()
+
     def _lookup_flights(
         self,
         date: datetime.date,
@@ -188,23 +275,408 @@ class TravelFinder:
         currency_code: str = "DKK",
     ) -> list[Flight]:
         """Find a flight between two airports on a specific date."""
-        db_flights = self.flight_db.get_flights(
+        key = ("one_way", from_airport.code, to_airport.code, date)
+
+        if self.flight_db.has_no_flights(from_airport.code, to_airport.code, date):
+            return []
+
+        cached = self.flight_db.get_flights(
             from_airport.code, to_airport.code, date
         )
+        if cached:
+            return cached
 
-        return db_flights
+        if not self._begin_inflight(key):
+            self._wait_for_inflight(key)
+            if self.flight_db.has_no_flights(from_airport.code, to_airport.code, date):
+                return []
+            return self.flight_db.get_flights(
+                from_airport.code, to_airport.code, date
+            )
 
-        if db_flights:
-            return db_flights
+        try:
+            if self.flight_db.has_no_flights(from_airport.code, to_airport.code, date):
+                return []
 
-        flights = self.flight_api.get_flights(
-            from_airport.code, to_airport.code, date, adults, currency_code
+            cached = self.flight_db.get_flights(
+                from_airport.code, to_airport.code, date
+            )
+            if cached:
+                return cached
+
+            result = self.flight_api.get_flights(
+                from_airport.code, to_airport.code, date, adults, currency_code
+            )
+
+            for flight in result.flights:
+                self.flight_db.add_flight(flight)
+
+            if result.no_flights_confirmed:
+                self.flight_db.mark_no_flights(
+                    from_airport.code, to_airport.code, date
+                )
+
+            return result.flights
+        finally:
+            self._finish_inflight(key)
+
+    def _lookup_round_trip_flights(
+        self,
+        outbound_date: datetime.date,
+        return_date: datetime.date,
+        from_airport: Airport,
+        to_airport: Airport,
+        adults: int = 2,
+        currency_code: str = "DKK",
+    ) -> list[tuple[Flight, Flight]]:
+        key = (
+            "round_trip",
+            from_airport.code,
+            to_airport.code,
+            outbound_date,
+            return_date,
         )
 
-        for flight in flights:
-            self.flight_db.add_flight(flight)
+        db_trips = self.flight_db.get_round_trips(
+            from_airport.code, to_airport.code, outbound_date, return_date
+        )
+        if db_trips:
+            return [(trip.outbound, trip.inbound) for trip in db_trips]
 
-        return flights
+        if self.flight_db.has_no_round_trips(
+            from_airport.code, to_airport.code, outbound_date, return_date
+        ):
+            return []
+
+        if not self._begin_inflight(key):
+            self._wait_for_inflight(key)
+            if self.flight_db.has_no_round_trips(
+                from_airport.code, to_airport.code, outbound_date, return_date
+            ):
+                return []
+            db_trips = self.flight_db.get_round_trips(
+                from_airport.code, to_airport.code, outbound_date, return_date
+            )
+            return [(trip.outbound, trip.inbound) for trip in db_trips]
+
+        try:
+            if self.flight_db.has_no_round_trips(
+                from_airport.code, to_airport.code, outbound_date, return_date
+            ):
+                return []
+
+            db_trips = self.flight_db.get_round_trips(
+                from_airport.code, to_airport.code, outbound_date, return_date
+            )
+            if db_trips:
+                return [(trip.outbound, trip.inbound) for trip in db_trips]
+
+            result = self.flight_api.get_round_trip_flights(
+                from_airport.code,
+                to_airport.code,
+                outbound_date,
+                return_date,
+                adults,
+                currency_code,
+            )
+
+            for outbound, inbound in result.trips:
+                self.flight_db.add_round_trip(outbound, inbound)
+
+            if result.no_flights_confirmed:
+                self.flight_db.mark_no_round_trips(
+                    from_airport.code,
+                    to_airport.code,
+                    outbound_date,
+                    return_date,
+                )
+
+            return result.trips
+        finally:
+            self._finish_inflight(key)
+
+    def _lookup_cheapest_hotel(
+        self,
+        city: str,
+        country: str,
+        checkin_date: datetime.date,
+        checkout_date: datetime.date,
+        adults: int = 2,
+        currency_code: str = "DKK",
+        min_hotel_rating: float | None = None,
+        min_hotel_stars: int | None = None,
+    ) -> Hotel | None:
+        key = ("hotel", city, country, checkin_date, checkout_date)
+
+        db_hotels = self.hotel_db.get_hotels(
+            checkin_date, checkout_date, city, country
+        )
+        if db_hotels:
+            return self._pick_cheapest_hotel(
+                db_hotels, min_hotel_rating, min_hotel_stars
+            )
+
+        if not self.hotel_api.rapid_api_key:
+            return None
+
+        if not self._begin_inflight(key):
+            self._wait_for_inflight(key)
+            db_hotels = self.hotel_db.get_hotels(
+                checkin_date, checkout_date, city, country
+            )
+            if db_hotels:
+                return self._pick_cheapest_hotel(
+                    db_hotels, min_hotel_rating, min_hotel_stars
+                )
+            return None
+
+        hotels: list[Hotel] = []
+        try:
+            db_hotels = self.hotel_db.get_hotels(
+                checkin_date, checkout_date, city, country
+            )
+            if db_hotels:
+                return self._pick_cheapest_hotel(
+                    db_hotels, min_hotel_rating, min_hotel_stars
+                )
+
+            hotels = self.hotel_api.get_hotels(
+                city,
+                country,
+                checkin_date,
+                checkout_date,
+                adults,
+                currency_code,
+            )
+        except (ValueError, OSError):
+            return None
+        finally:
+            self._finish_inflight(key)
+
+        if not hotels:
+            return None
+
+        for hotel in hotels:
+            self.hotel_db.add_hotel(hotel)
+
+        return self._pick_cheapest_hotel(hotels, min_hotel_rating, min_hotel_stars)
+
+    def _lookup_hotels_parallel(
+        self,
+        tasks: list[HotelSearchTask],
+        adults: int,
+        currency_code: str,
+        max_workers: int,
+        min_hotel_rating: float | None = None,
+        min_hotel_stars: int | None = None,
+    ) -> dict[tuple[str, datetime.date, datetime.date], Hotel]:
+        results: dict[tuple[str, datetime.date, datetime.date], Hotel] = {}
+
+        def fetch(task: HotelSearchTask) -> tuple[HotelSearchTask, Hotel | None]:
+            hotel = self._lookup_cheapest_hotel(
+                task.city,
+                task.country,
+                task.checkin_date,
+                task.checkout_date,
+                adults,
+                currency_code,
+                min_hotel_rating,
+                min_hotel_stars,
+            )
+            return task, hotel
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch, task) for task in tasks]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Hotels",
+            ):
+                task, hotel = future.result()
+                if hotel is not None:
+                    results[
+                        (task.destination_code, task.checkin_date, task.checkout_date)
+                    ] = hotel
+
+        return results
+
+    def _fetch_destination_flight_options(
+        self,
+        departure: datetime.date,
+        return_date: datetime.date,
+        fly_from: Airport,
+        destination: Airport,
+        adults: int,
+        currency_code: str,
+    ) -> DestinationFlightOptions:
+        outbound_one_way = self._lookup_flights(
+            departure, fly_from, destination, adults, currency_code
+        )
+        return_one_way = self._lookup_flights(
+            return_date, destination, fly_from, adults, currency_code
+        )
+        round_trips = self._lookup_round_trip_flights(
+            departure,
+            return_date,
+            fly_from,
+            destination,
+            adults,
+            currency_code,
+        )
+        return DestinationFlightOptions(
+            outbound_one_way=outbound_one_way,
+            return_one_way=return_one_way,
+            round_trips=round_trips,
+        )
+
+    def _filter_flights(
+        self,
+        flights: list[Flight],
+        max_stops: int,
+        max_flight_duration: int | None,
+        remove_bad_flights: bool,
+    ) -> list[Flight]:
+        filtered = [flight for flight in flights if flight.stops <= max_stops]
+
+        if max_flight_duration:
+            filtered = [
+                flight
+                for flight in filtered
+                if (flight.arrival_time - flight.departure_time).total_seconds() / 3600
+                <= max_flight_duration
+            ]
+
+        if remove_bad_flights:
+            filtered = [
+                flight
+                for flight in filtered
+                if flight.arrival_time.hour > 6 and flight.arrival_time.hour < 22
+            ]
+
+        return filtered
+
+    def _trip_passes_constraints(
+        self,
+        outbound: Flight,
+        inbound: Flight,
+        vacation_days: int,
+        min_full_days: int,
+        auto_extend_trip: bool,
+    ) -> bool:
+        vacation_days_used = self._count_vacation_days_in_stay(
+            outbound.departure_time.date(),
+            inbound.departure_time.date(),
+        )
+
+        if auto_extend_trip and vacation_days_used > vacation_days:
+            if outbound.departure_time.hour <= 16:
+                return False
+
+        days_between = (
+            inbound.departure_time.date() - outbound.arrival_time.date()
+        ).days + 1
+
+        if days_between == min_full_days:
+            if outbound.arrival_time.hour >= 12 or inbound.departure_time.hour <= 20:
+                return False
+
+        return True
+
+    def _select_cheapest_trip(
+        self,
+        flight_options: DestinationFlightOptions,
+        vacation_days: int,
+        max_stops: int,
+        max_flight_duration: int | None,
+        remove_bad_flights: bool,
+        min_full_days: int,
+        auto_extend_trip: bool,
+    ) -> tuple[Flight, Flight] | None:
+        candidates: list[tuple[Flight, Flight]] = []
+
+        outbound_one_way = self._filter_flights(
+            flight_options.outbound_one_way,
+            max_stops,
+            max_flight_duration,
+            remove_bad_flights,
+        )
+        return_one_way = self._filter_flights(
+            flight_options.return_one_way,
+            max_stops,
+            max_flight_duration,
+            remove_bad_flights,
+        )
+
+        if outbound_one_way and return_one_way:
+            if self._trip_passes_constraints(
+                outbound_one_way[0],
+                return_one_way[0],
+                vacation_days,
+                min_full_days,
+                auto_extend_trip,
+            ):
+                valid_outbound = outbound_one_way
+                valid_return = return_one_way
+
+                if auto_extend_trip and self._count_vacation_days_in_stay(
+                    outbound_one_way[0].departure_time.date(),
+                    return_one_way[0].departure_time.date(),
+                ) > vacation_days:
+                    valid_outbound = [
+                        flight
+                        for flight in outbound_one_way
+                        if flight.departure_time.hour > 16
+                    ]
+
+                days_between = (
+                    return_one_way[0].departure_time.date()
+                    - outbound_one_way[0].arrival_time.date()
+                ).days + 1
+                if days_between == min_full_days:
+                    valid_outbound = [
+                        flight
+                        for flight in valid_outbound
+                        if flight.arrival_time.hour < 12
+                    ]
+                    valid_return = [
+                        flight
+                        for flight in return_one_way
+                        if flight.departure_time.hour > 20
+                    ]
+
+                if valid_outbound and valid_return:
+                    candidates.append(
+                        (
+                            min(valid_outbound, key=lambda flight: flight.price),
+                            min(valid_return, key=lambda flight: flight.price),
+                        )
+                    )
+
+        for outbound, inbound in flight_options.round_trips:
+            filtered_outbound = self._filter_flights(
+                [outbound], max_stops, max_flight_duration, remove_bad_flights
+            )
+            filtered_inbound = self._filter_flights(
+                [inbound], max_stops, max_flight_duration, remove_bad_flights
+            )
+            if not filtered_outbound or not filtered_inbound:
+                continue
+
+            outbound = filtered_outbound[0]
+            inbound = filtered_inbound[0]
+            if self._trip_passes_constraints(
+                outbound,
+                inbound,
+                vacation_days,
+                min_full_days,
+                auto_extend_trip,
+            ):
+                candidates.append((outbound, inbound))
+
+        if not candidates:
+            return None
+
+        return min(candidates, key=lambda trip: trip[0].price + trip[1].price)
 
     def find_flights(
         self,
@@ -213,20 +685,38 @@ class TravelFinder:
         destinations: list[Airport],
         adults: int = 2,
         currency_code: str = "DKK",
-    ) -> list[tuple[list[Flight], list[Flight]]]:
-        flights = []
-        for departure, return_date in tqdm(dates):
-            for destination in destinations:
-                out = self._lookup_flights(
-                    departure, fly_from, destination, adults, currency_code
-                )
-                back = self._lookup_flights(
-                    return_date, destination, fly_from, adults, currency_code
-                )
-                flights.append((out, back))
+        max_workers: int | None = None,
+    ) -> list[DestinationFlightOptions]:
+        workers = max_workers or _default_max_workers()
+        tasks = [
+            (departure, return_date, destination)
+            for departure, return_date in dates
+            for destination in destinations
+        ]
 
-            self.flight_db.save_db()
+        flights: list[DestinationFlightOptions] = []
 
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    self._fetch_destination_flight_options,
+                    departure,
+                    return_date,
+                    fly_from,
+                    destination,
+                    adults,
+                    currency_code,
+                )
+                for departure, return_date, destination in tasks
+            ]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Flights",
+            ):
+                flights.append(future.result())
+
+        self.flight_db.save_db()
         return flights
 
     def _count_vacation_days_in_stay(
@@ -967,11 +1457,14 @@ if __name__ == "__main__":
         max_flight_duration=12,
     )
 
-    for flight in flights.values():
-        print(f"To: {flight[0].arrival.city}")
-        print(f"Airline out: {flight[0].airline}")
-        print(f"Out: {flight[0].departure_time} - {flight[0].arrival_time}")
-        print(f"Airline back: {flight[1].airline}")
-        print(f"Back: {flight[1].departure_time} - {flight[1].arrival_time}")
-        print(f"Price: {flight[0].price + flight[1].price}")
+    for option in flights.values():
+        print(f"To: {option.outbound.arrival.city}")
+        print(f"Airline out: {option.outbound.airline}")
+        print(f"Out: {option.outbound.departure_time} - {option.outbound.arrival_time}")
+        print(f"Airline back: {option.inbound.airline}")
+        print(f"Back: {option.inbound.departure_time} - {option.inbound.arrival_time}")
+        print(f"Flight price: {option.flight_total}")
+        if option.hotel:
+            print(f"Hotel: {option.hotel.name} ({option.hotel.price} DKK)")
+        print(f"Total: {option.total}")
         print("")

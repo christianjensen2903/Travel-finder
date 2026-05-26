@@ -14,10 +14,14 @@ class HotelAPI:
     def _get_city_id(self, city_name: str) -> str:
 
         # Read city id from city_ids.json
-        with open("city_ids.json", "r") as file:
-            city_ids = json.load(file)
-            if city_name in city_ids:
-                return city_ids[city_name]
+        try:
+            with open("city_ids.json", "r") as file:
+                city_ids = json.load(file)
+        except FileNotFoundError:
+            city_ids = {}
+
+        if city_name in city_ids:
+            return city_ids[city_name]
 
         url = "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination"
 
@@ -47,20 +51,27 @@ class HotelAPI:
 
     def _parse_hotels(self, data: dict, city: str, country: str) -> list[Hotel]:
         hotels = []
-        for h in data["data"]["hotels"]:
+        try:
+            hotel_rows = data["data"]["hotels"]
+        except KeyError:
+            return []
+
+        for h in hotel_rows:
             hotel = h["property"]
             checkin_date = datetime.datetime.fromisoformat(hotel["checkinDate"]).date()
             checkout_date = datetime.datetime.fromisoformat(
                 hotel["checkoutDate"]
             ).date()
             price = hotel["priceBreakdown"]["grossPrice"]["value"]
+            stars = hotel.get("accuratePropertyClass") or hotel.get("propertyClass") or 0
             hotels.append(
                 Hotel(
                     name=hotel["name"],
                     city=city,
                     country=country,
                     price=price,
-                    rating=hotel["reviewScore"],
+                    rating=hotel.get("reviewScore") or 0.0,
+                    stars=int(stars),
                     checkin_date=checkin_date,
                     checkout_date=checkout_date,
                 )
@@ -97,10 +108,10 @@ class HotelAPI:
             "dest_id": city_id,
             "search_type": "CITY",
             "adults": adults,
-            "departure_date": checkin_formatted,
-            "arrival_date": checkout_formatted,
+            "arrival_date": checkin_formatted,
+            "departure_date": checkout_formatted,
             "currency_code": currency_code,
-            "sort_by": "popularity",
+            "sort_by": "price",
         }
 
         headers = {

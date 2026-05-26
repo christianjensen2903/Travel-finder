@@ -2,5 +2,8 @@
 venv
 __pycache__
 flights.json
+round_trips.json
+flight_misses.json
+hotels.json
 .mypy_cache
 .venv

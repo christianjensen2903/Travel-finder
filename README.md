@@ -39,7 +39,7 @@ pip install -r requirements.txt
 
 4. Create a `.env` file in the project root:
 ```env
-RAPIDAPI_KEY=your_rapidapi_key_here
+RAPID_API_KEY=your_rapidapi_key_here
 ```
 
 ### Required Dependencies
